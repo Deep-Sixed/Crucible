@@ -119,9 +119,11 @@ baseline define ignored output. Files under a prohibited path are blocked even w
 ignored. Repositories that rely on clean filters, such as Git LFS or line-ending
 conversion, may therefore report extra changes. Submodule contents are not inspected.
 
-**Output redaction:** stored command summaries mask common secret formats, including
-tokens, password assignments, authorization headers, URL credentials, and private keys.
-This is best effort, so treat stored output as potentially sensitive.
+**Command output:** agent-controlled stdout and stderr are not stored by default.
+Results record only their byte counts. An operator can set
+`CRUCIBLE_PERSIST_REDACTED_OUTPUT=1` to store a redacted tail for debugging. Redaction
+masks common tokens, passwords, authorization headers, URL credentials, and private keys,
+but it is best effort, so treat that output as sensitive.
 
 **Resource limits:** sandboxed work runs in a systemd cgroup scope limited to 4 GiB of
 memory with no swap, 256 tasks, and 200% CPU. `/tmp` is limited to 1 GiB and the
@@ -130,8 +132,9 @@ workspace to 2 GiB. Preflight reads the limits back from the kernel.
 Crucible requires Bubblewrap 0.8 or newer and a `systemd --user` session with the
 `memory`, `pids`, and `cpu` cgroup controllers delegated. If any are missing, it refuses
 to run Git or validation commands. `--repo` and `--worktree` must be checkout roots.
-Extra read-only toolchains, such as a virtualenv, can be exposed with the colon-separated
-`CRUCIBLE_SANDBOX_RO_PATHS`.
+Extra read-only toolchains can be exposed with the colon-separated
+`CRUCIBLE_SANDBOX_RO_PATHS`. Each entry must be a virtualenv or a toolchain with a `bin`
+directory under `/opt`; system directories and other paths are refused.
 
 Separately, each attempt's diff is checked against three path classes:
 

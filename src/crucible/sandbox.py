@@ -30,6 +30,8 @@ MAX_WORKSPACE_BYTES = 1024**3
 MAX_FILE_BYTES = 1024**3
 OUTPUT_TAIL_BYTES = 64 * 1024
 RO_PATHS_ENV = "CRUCIBLE_SANDBOX_RO_PATHS"
+PERSIST_OUTPUT_ENV = "CRUCIBLE_PERSIST_REDACTED_OUTPUT"
+_PROTECTED_ROOTS = ("/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/var")
 DEFAULT_TOOLCHAIN_PATHS = ("/opt/python",)
 REDACTED = "[REDACTED]"
 _SECRET_NAME = (
@@ -119,8 +121,20 @@ def toolchain_paths() -> list[str]:
             raise SandboxUnavailable(f"ro_path_exposes_home: {raw}")
         if _FORBIDDEN_RO_SEGMENTS.intersection(resolved.parts):
             raise SandboxUnavailable(f"ro_path_exposes_credentials: {raw}")
+        if not _is_toolchain(resolved):
+            raise SandboxUnavailable(f"invalid_ro_path: {raw}")
         paths.append(str(resolved))
     return sorted(set(paths))
+
+
+def _is_toolchain(path: Path) -> bool:
+    """Accept a virtualenv or an installed toolchain under /opt, never a system directory."""
+
+    if any(path.is_relative_to(root) for root in _PROTECTED_ROOTS):
+        return False
+    if (path / "pyvenv.cfg").is_file():
+        return True
+    return path.is_relative_to("/opt") and len(path.parts) >= 3 and (path / "bin").is_dir()
 
 
 def _sandbox_path(toolchains: Sequence[str]) -> str:
@@ -284,9 +298,15 @@ class BubblewrapCommandRunner:
         self,
         timeout_seconds: int = 300,
         limits: ResourceLimits = DEFAULT_LIMITS,
+        persist_output: bool | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.limits = limits
+        self.persist_output = (
+            os.environ.get(PERSIST_OUTPUT_ENV) == "1"
+            if persist_output is None
+            else persist_output
+        )
 
     def preflight(self) -> None:
         """Prove the isolation properties before any agent-controlled code runs."""
@@ -376,7 +396,7 @@ class BubblewrapCommandRunner:
                 returncode, timed_out = completed.returncode, False
             except subprocess.TimeoutExpired:
                 returncode, timed_out = -1, True
-            summary = _tail(stdout) or _tail(stderr)
+            summary = _summarize(stdout, stderr, self.persist_output)
         return CommandResult(
             argv=list(argv),
             passed=returncode == 0 and not timed_out,
@@ -386,6 +406,19 @@ class BubblewrapCommandRunner:
             timed_out=timed_out,
             sandboxed=True,
         )
+
+
+def _summarize(stdout, stderr, persist_output: bool) -> str:
+    """Store agent-controlled output only when the operator explicitly opts in."""
+
+    if persist_output:
+        return _tail(stdout) or _tail(stderr)
+    stdout_bytes = stdout.seek(0, os.SEEK_END)
+    stderr_bytes = stderr.seek(0, os.SEEK_END)
+    return (
+        f"output suppressed: stdout={stdout_bytes} bytes, stderr={stderr_bytes} bytes; "
+        f"set {PERSIST_OUTPUT_ENV}=1 to store redacted output"
+    )
 
 
 def _tail(handle) -> str:

@@ -24,6 +24,7 @@ from crucible.sandbox import (
     SandboxUnavailable,
     _redact_summary,
     read_scope_limits,
+    toolchain_paths,
 )
 from crucible.schemas import ATTESTATION_KEYS, CommandResult
 
@@ -679,6 +680,61 @@ def test_ordinary_output_is_not_redacted() -> None:
 def test_persisted_command_summary_is_redacted(repo: Path, runs_root: Path) -> None:
     secret = "gh" + "p_" + "z" * 36
     source = "print('leaked', 'gh' + 'p_' + 'z' * 36)"
-    _collected, payload = run_attempt(repo, runs_root, python_check(source))
+    _collected, payload = run_attempt(
+        repo,
+        runs_root,
+        python_check(source),
+        command_runner=BubblewrapCommandRunner(persist_output=True),
+    )
     assert secret not in json.dumps(payload)
     assert "[REDACTED]" in payload["test_results"][0]["summary"]
+
+
+def test_command_output_is_suppressed_by_default(
+    repo: Path, runs_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CRUCIBLE_PERSIST_REDACTED_OUTPUT", raising=False)
+    source = "import sys; print('stdout-marker'); print('stderr-marker', file=sys.stderr)"
+    _collected, payload = run_attempt(repo, runs_root, python_check(source))
+    summary = payload["test_results"][0]["summary"]
+    assert summary.startswith("output suppressed: stdout=14 bytes, stderr=14 bytes")
+    serialized = json.dumps(payload["test_results"][0]["summary"])
+    assert "stdout-marker" not in serialized
+    assert "stderr-marker" not in serialized
+
+
+def test_output_persistence_requires_explicit_opt_in(
+    repo: Path, runs_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CRUCIBLE_PERSIST_REDACTED_OUTPUT", "1")
+    _collected, payload = run_attempt(repo, runs_root, python_check("print('visible')"))
+    assert payload["test_results"][0]["summary"] == "visible\n"
+
+
+@pytest.mark.parametrize("path", ["/etc", "/var", "/usr", "/tmp"])
+def test_system_directories_are_rejected_as_toolchains(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CRUCIBLE_SANDBOX_RO_PATHS", path)
+    with pytest.raises(SandboxUnavailable, match="invalid_ro_path|ro_path_exposes"):
+        toolchain_paths()
+
+
+def test_plain_directory_is_rejected_as_toolchain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setenv("CRUCIBLE_SANDBOX_RO_PATHS", str(plain))
+    with pytest.raises(SandboxUnavailable, match="invalid_ro_path"):
+        toolchain_paths()
+
+
+def test_virtualenv_is_accepted_as_toolchain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    monkeypatch.setenv("CRUCIBLE_SANDBOX_RO_PATHS", str(venv))
+    assert str(venv.resolve()) in toolchain_paths()
