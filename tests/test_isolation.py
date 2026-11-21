@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from crucible.sandbox import (
     BubblewrapCommandRunner,
     ResourceLimits,
     SandboxUnavailable,
+    _redact_summary,
     read_scope_limits,
 )
 from crucible.schemas import ATTESTATION_KEYS, CommandResult
@@ -497,3 +499,185 @@ def test_missing_cgroup_support_fails_closed(
     _collected, payload = collect_attempt(runs_root)
     assert not marker.exists()
     assert payload["test_results"][0]["returncode"] == 126
+
+
+def run_prohibited(repo: Path, runs_root: Path):
+    create_harness_run(
+        task_summary="Boundary evasion",
+        baseline_ref="baseline",
+        repo_root=repo,
+        runs_root=runs_root,
+        run_id="run-1",
+        prohibited_paths=["deploy"],
+        required_tests=[["true"]],
+    )
+    register_model_attempt(
+        run_id="run-1",
+        model_provider="local",
+        model_name="probe",
+        ide_host="pytest",
+        worktree_path=repo,
+        attempt_id="probe-1",
+        runs_root=runs_root,
+    )
+    _collected, payload = collect_attempt(runs_root)
+    return payload, compare_model_results(run_id="run-1", runs_root=runs_root)
+
+
+@pytest.fixture
+def boundary_repo(repo: Path) -> Path:
+    (repo / "deploy").mkdir()
+    (repo / "deploy" / "prod.conf").write_text("safe\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("build/\n*.log\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "boundary"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "baseline"], cwd=repo, check=True)
+    return repo
+
+
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=repo, check=True)
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        "assume_unchanged",
+        "skip_worktree",
+        "lying_clean_filter",
+        "info_exclude",
+        "core_excludes_file",
+        "nested_gitignore",
+        "edited_root_gitignore",
+    ],
+)
+def test_git_metadata_cannot_hide_prohibited_changes(
+    boundary_repo: Path, runs_root: Path, vector: str
+) -> None:
+    repo = boundary_repo
+    conf = repo / "deploy" / "prod.conf"
+    backdoor = repo / "deploy" / "backdoor.sh"
+    if vector == "assume_unchanged":
+        git(repo, "update-index", "--assume-unchanged", "deploy/prod.conf")
+        conf.write_text("tampered\n", encoding="utf-8")
+    elif vector == "skip_worktree":
+        git(repo, "update-index", "--skip-worktree", "deploy/prod.conf")
+        conf.write_text("tampered\n", encoding="utf-8")
+    elif vector == "lying_clean_filter":
+        git(repo, "config", "filter.hide.clean", "printf 'safe\\n'")
+        (repo / ".git" / "info" / "attributes").write_text(
+            "deploy/prod.conf filter=hide\n", encoding="utf-8"
+        )
+        conf.write_text("tampered\n", encoding="utf-8")
+    elif vector == "info_exclude":
+        with (repo / ".git" / "info" / "exclude").open("a", encoding="utf-8") as handle:
+            handle.write("deploy/backdoor.sh\n")
+        backdoor.write_text("x\n", encoding="utf-8")
+    elif vector == "core_excludes_file":
+        hidden = repo / ".git" / "hidden-excludes"
+        hidden.write_text("deploy/backdoor.sh\n", encoding="utf-8")
+        git(repo, "config", "core.excludesFile", str(hidden))
+        backdoor.write_text("x\n", encoding="utf-8")
+    elif vector == "nested_gitignore":
+        (repo / "deploy" / ".gitignore").write_text("*\n", encoding="utf-8")
+        backdoor.write_text("x\n", encoding="utf-8")
+    else:
+        (repo / ".gitignore").write_text("build/\n*.log\ndeploy/\n", encoding="utf-8")
+        backdoor.write_text("x\n", encoding="utf-8")
+
+    payload, comparison = run_prohibited(repo, runs_root)
+    assert payload["prohibited_violations"], vector
+    assert comparison["recommended_attempt_id"] is None
+    assert "prohibited_path_violations" in comparison["blockers"]
+
+
+def test_hidden_deletion_is_detected(boundary_repo: Path, runs_root: Path) -> None:
+    git(boundary_repo, "update-index", "--skip-worktree", "deploy/prod.conf")
+    (boundary_repo / "deploy" / "prod.conf").unlink()
+    payload, comparison = run_prohibited(boundary_repo, runs_root)
+    assert payload["prohibited_violations"] == ["deploy/prod.conf"]
+    assert payload["lines_deleted"] == 1
+    assert comparison["recommended_attempt_id"] is None
+
+
+def test_baseline_ignored_output_is_not_a_change(boundary_repo: Path, runs_root: Path) -> None:
+    (boundary_repo / "build").mkdir()
+    (boundary_repo / "build" / "out.txt").write_text("generated\n", encoding="utf-8")
+    (boundary_repo / "debug.log").write_text("log\n", encoding="utf-8")
+    payload, comparison = run_prohibited(boundary_repo, runs_root)
+    assert payload["files_changed"] == []
+    assert comparison["recommended_attempt_id"] == "probe-1"
+
+
+def test_baseline_ignored_file_under_prohibited_path_blocks(
+    boundary_repo: Path, runs_root: Path
+) -> None:
+    (boundary_repo / "deploy" / "payload.log").write_text("x\n", encoding="utf-8")
+    payload, comparison = run_prohibited(boundary_repo, runs_root)
+    assert payload["prohibited_violations"] == ["deploy/payload.log"]
+    assert comparison["recommended_attempt_id"] is None
+
+
+def test_clean_attempt_with_real_edit_counts_lines(boundary_repo: Path, runs_root: Path) -> None:
+    (boundary_repo / "README.md").write_text("baseline\nadded\n", encoding="utf-8")
+    payload, comparison = run_prohibited(boundary_repo, runs_root)
+    assert payload["files_changed"] == ["README.md"]
+    assert (payload["lines_added"], payload["lines_deleted"]) == (1, 0)
+    assert comparison["recommended_attempt_id"] == "probe-1"
+
+
+def test_unusual_filenames_do_not_break_collection(boundary_repo: Path, runs_root: Path) -> None:
+    raw = os.fsencode(boundary_repo) + b"/caf\xe9.txt"
+    with open(raw, "wb") as handle:
+        handle.write(b"x\n")
+    (boundary_repo / "line\nbreak.txt").write_text("x\n", encoding="utf-8")
+    payload, _comparison = run_prohibited(boundary_repo, runs_root)
+    assert "caf\\xe9.txt" in payload["files_changed"]
+    assert "line\nbreak.txt" in payload["files_changed"]
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "gh" + "p_" + "a" * 36,
+        "github_" + "pat_" + "b" * 40,
+        "sk-" + "c" * 32,
+        "AK" + "IA" + "D" * 16,
+        "xo" + "xb-" + "1234567890-abcdef",
+        "ey" + "J" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12,
+    ],
+)
+def test_known_token_formats_are_redacted(secret: str) -> None:
+    summary = _redact_summary(f"before {secret} after")
+    assert secret not in summary
+    assert summary == "before [REDACTED] after"
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("DB_PASSWORD=hunter2value", "hunter2value"),
+        ('api_key: "quoted-value"', "quoted-value"),
+        ("Authorization: Bearer opaque-value-123", "opaque-value-123"),
+        ("https://user:url-password@example.invalid/repo", "url-password"),
+        (
+            "-----BEGIN " + "PRIVATE KEY-----\nkey-material\n-----END " + "PRIVATE KEY-----",
+            "key-material",
+        ),
+        ("-----BEGIN " + "RSA PRIVATE KEY-----\nunterminated-material", "unterminated-material"),
+    ],
+)
+def test_secret_assignments_are_redacted(text: str, value: str) -> None:
+    assert value not in _redact_summary(text)
+
+
+def test_ordinary_output_is_not_redacted() -> None:
+    text = "tests passed: 12, failed: 0\nsrc/token_parser.py ok"
+    assert _redact_summary(text) == text
+
+
+def test_persisted_command_summary_is_redacted(repo: Path, runs_root: Path) -> None:
+    secret = "gh" + "p_" + "z" * 36
+    _collected, payload = run_attempt(repo, runs_root, ["echo", f"leaked {secret}"])
+    assert secret not in json.dumps(payload)
+    assert "[REDACTED]" in payload["test_results"][0]["summary"]

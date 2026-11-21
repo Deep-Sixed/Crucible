@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, Sequence
 
@@ -16,13 +17,27 @@ from .artifact_store import (
     run_lock,
     write_attempt_result,
 )
+from .inventory import (
+    GITLINK_MODE,
+    REGULAR_MODE,
+    EXECUTABLE_MODE,
+    SPECIAL_MODE,
+    blob_id,
+    parse_tree,
+    walk_worktree,
+    write_loose_blob,
+)
 from .run_manager import update_run_status
 from .sandbox import (
+    MAX_WORKSPACE_BYTES,
     BubblewrapCommandRunner,
     SandboxUnavailable,
     prepare_workspace,
     remove_workspace,
+    run_git_bytes,
     run_sandboxed_git,
+    run_scratch_git,
+    scratch_index_env,
 )
 from .schemas import (
     ATTESTATION_KEYS,
@@ -165,6 +180,9 @@ def _collect_attempt(
     untracked_visible = [
         path for path in snapshot.get("untracked_files", []) if not _is_sensitive(path)
     ]
+    ignored_visible = [
+        path for path in snapshot.get("ignored_files", []) if not _is_sensitive(path)
+    ]
 
     blocked_reason = sandbox_error
     if blocked_reason is None and before is None:
@@ -215,7 +233,7 @@ def _collect_attempt(
         untracked_files=untracked_visible,
         scope_violations=_scope_violations(visible_paths, run.allowed_paths),
         prohibited_violations=_prohibited_violations(
-            visible_paths, run.prohibited_paths
+            sorted({*visible_paths, *ignored_visible}), run.prohibited_paths
         ),
         sensitive_paths_found=[_redact_sensitive_path(path) for path in sensitive_raw],
         test_results=test_results,
@@ -345,85 +363,41 @@ def _build_attestations(
 
 
 class SubprocessGitExecutor:
+    """Compare real files with the baseline commit, ignoring attempt-controlled Git state."""
+
     def __init__(self, worktree: Path, repo_root: Path | None = None) -> None:
         self.worktree = worktree.resolve()
         self.repo_root = repo_root.resolve() if repo_root else None
+        self._baseline: str | None = None
 
     def snapshot(self, baseline_sha: str) -> dict[str, Any]:
         if not self.worktree.is_dir():
             raise EvaluationEngineError(f"worktree_not_found: {self.worktree}")
+        self._baseline = baseline_sha
+        try:
+            with tempfile.TemporaryDirectory(prefix="crucible-inventory-") as temporary:
+                scratch = Path(temporary)
+                inventory = self._inventory(baseline_sha, scratch)
+                changed, added, deleted = self._changes(baseline_sha, inventory, scratch)
+        except OSError as exc:
+            raise EvaluationEngineError(f"worktree_unreadable: {exc}") from exc
 
-        diff = self._git(
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                "--numstat",
-                "-z",
-                baseline_sha,
-                "--",
-            ],
-            timeout=60,
-        )
-        if diff.returncode != 0:
-            raise EvaluationEngineError(
-                f"git_diff_failed: {diff.stderr.strip()[:300]}"
-            )
-
-        files_changed: list[str] = []
-        lines_added = 0
-        lines_deleted = 0
-        for line in diff.stdout.split("\0"):
-            parts = line.split("\t", 2)
-            if len(parts) != 3:
-                continue
-            added, deleted, path = parts
-            files_changed.append(_normalize_git_path(path))
-            if added.isdigit():
-                lines_added += int(added)
-            if deleted.isdigit():
-                lines_deleted += int(deleted)
-
-        untracked = self._git(
-            ["ls-files", "--others", "--exclude-standard", "-z"],
-            timeout=30,
-        )
-        if untracked.returncode != 0:
-            raise EvaluationEngineError(
-                f"git_untracked_failed: {untracked.stderr.strip()[:300]}"
-            )
-        untracked_files = [
-            _normalize_git_path(path)
-            for path in untracked.stdout.split("\0")
-            if path
-        ]
-        for relative in untracked_files:
-            if relative not in files_changed:
-                files_changed.append(relative)
-            path = self.worktree / relative
-            if path.is_file() and not path.is_symlink():
-                try:
-                    with path.open("rb") as handle:
-                        sample = handle.read(8192)
-                    if b"\0" not in sample:
-                        with path.open(
-                            "r", encoding="utf-8", errors="replace"
-                        ) as handle:
-                            lines_added += sum(1 for _ in handle)
-                except OSError:
-                    pass
-
+        indexed = self._bytes(["ls-files", "--cached", "-z"], "git_index_failed")
+        cached = {os.fsdecode(path) for path in indexed.split(b"\0") if path}
+        untracked = [path for path in inventory["new"] if path not in cached]
         return {
-            "files_changed": sorted(set(files_changed)),
-            "untracked_files": sorted(set(untracked_files)),
-            "lines_added": lines_added,
-            "lines_deleted": lines_deleted,
+            "files_changed": sorted({_display_path(path) for path in changed}),
+            "untracked_files": sorted({_display_path(path) for path in untracked}),
+            "ignored_files": sorted({_display_path(path) for path in inventory["ignored"]}),
+            "lines_added": added,
+            "lines_deleted": deleted,
         }
 
     def state(self) -> tuple[dict[str, str], list[str]]:
-        """Fingerprint HEAD, refs, status and file contents without storing raw paths."""
+        """Fingerprint HEAD, refs, status and real file contents without storing raw paths."""
 
+        if self._baseline is None:
+            raise EvaluationEngineError("snapshot_required")
         head = self._checked(["rev-parse", "HEAD"], "git_head_failed")
         refs = self._checked(
             ["for-each-ref", "--format=%(objectname) %(refname)"], "git_refs_failed"
@@ -432,20 +406,209 @@ class SubprocessGitExecutor:
             ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
             "git_status_failed",
         )
-        listed = self._checked(
-            ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            "git_files_failed",
-        )
-        files = sorted({path for path in listed.split("\0") if path})
+        try:
+            with tempfile.TemporaryDirectory(prefix="crucible-inventory-") as temporary:
+                files = self._inventory(self._baseline, Path(temporary))["live"]
+            content = _content_digest(self.worktree, files)
+        except OSError as exc:
+            raise EvaluationEngineError(f"worktree_unreadable: {exc}") from exc
         return (
             {
                 "head": head.strip(),
                 "refs": refs,
                 "status": _digest(status),
-                "content": _content_digest(self.worktree, files),
+                "content": content,
             },
             files,
         )
+
+    def _inventory(self, baseline: str, scratch: Path) -> dict[str, Any]:
+        listing = self._bytes(
+            ["ls-tree", "-r", "-z", "--full-tree", baseline], "git_tree_failed"
+        )
+        tracked = parse_tree(listing)
+        gitlinks = {path for path, (mode, _oid) in tracked.items() if mode == GITLINK_MODE}
+        found = walk_worktree(self.worktree, gitlinks)
+        new = sorted(set(found) - set(tracked))
+        ignored = self._baseline_ignored(tracked, new, scratch)
+        live_new = [path for path in new if path not in ignored]
+        return {
+            "tracked": tracked,
+            "found": found,
+            "new": live_new,
+            "ignored": sorted(ignored),
+            "live": sorted({*(set(found) & set(tracked)), *live_new}),
+        }
+
+    def _baseline_ignored(
+        self,
+        tracked: dict[str, tuple[str, str]],
+        candidates: list[str],
+        scratch: Path,
+    ) -> set[str]:
+        """Apply only the baseline's .gitignore files, which the attempt cannot edit."""
+
+        rules = {
+            path: oid
+            for path, (mode, oid) in tracked.items()
+            if PurePosixPath(path).name == ".gitignore"
+            and mode in {REGULAR_MODE, EXECUTABLE_MODE}
+        }
+        eligible = [path for path in candidates if ".git" not in PurePosixPath(path).parts]
+        if not rules or not eligible:
+            return set()
+
+        init = self._scratch_git(scratch, ["init", "-q", "ignore"])
+        if init.returncode != 0:
+            raise EvaluationEngineError("git_ignore_repo_failed")
+        root = scratch / "ignore"
+        for path, oid in rules.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self._bytes(["cat-file", "blob", oid], "git_ignore_read_failed"))
+        payload = b"".join(os.fsencode(path) + b"\0" for path in eligible)
+        checked = self._scratch_git(
+            scratch,
+            ["check-ignore", "-z", "--stdin", "--no-index"],
+            directory="ignore",
+            input_bytes=payload,
+        )
+        if checked.returncode not in {0, 1}:
+            raise EvaluationEngineError("git_ignore_check_failed")
+        return {os.fsdecode(path) for path in checked.stdout.split(b"\0") if path}
+
+    def _changes(
+        self,
+        baseline: str,
+        inventory: dict[str, Any],
+        scratch: Path,
+    ) -> tuple[list[str], int, int]:
+        tracked = inventory["tracked"]
+        found = inventory["found"]
+        algorithm = self._bytes(
+            ["rev-parse", "--show-object-format"], "git_object_format_failed"
+        ).decode("ascii").strip()
+        null_oid = "0" * hashlib.new(algorithm).digest_size * 2
+        objects = scratch / "objects"
+        objects.mkdir()
+        env = scratch_index_env(self.worktree, self.repo_root)
+
+        changed: list[str] = []
+        removals: list[bytes] = []
+        additions: list[bytes] = []
+        copied_bytes = 0
+        for path, (_mode, _oid) in tracked.items():
+            if path not in found:
+                changed.append(path)
+                removals.append(f"0 {null_oid}\t".encode() + os.fsencode(path) + b"\0")
+        for path in inventory["live"]:
+            mode = found[path]
+            previous = tracked.get(path)
+            if mode == GITLINK_MODE:
+                if previous is None or previous[0] != GITLINK_MODE:
+                    changed.append(path)
+                continue
+            if mode == SPECIAL_MODE:
+                changed.append(path)
+                if previous is not None:
+                    removals.append(f"0 {null_oid}\t".encode() + os.fsencode(path) + b"\0")
+                continue
+            full = self.worktree / path
+            if previous == (mode, blob_id(full, mode, algorithm)):
+                continue
+            changed.append(path)
+            copied_bytes += full.lstat().st_size
+            if copied_bytes > MAX_WORKSPACE_BYTES:
+                raise EvaluationEngineError("changed_files_too_large")
+            oid = write_loose_blob(objects, full, mode, algorithm)
+            additions.append(f"{mode} {oid}\t".encode() + os.fsencode(path) + b"\0")
+
+        if not changed:
+            return [], 0, 0
+        self._bytes(["read-tree", baseline], "git_index_failed", scratch=scratch, env=env)
+        if removals or additions:
+            self._bytes(
+                ["update-index", "-z", "--index-info"],
+                "git_index_failed",
+                scratch=scratch,
+                env=env,
+                input_bytes=b"".join([*removals, *additions]),
+            )
+        numstat = self._bytes(
+            [
+                "diff-index",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--numstat",
+                "-z",
+                baseline,
+            ],
+            "git_diff_failed",
+            scratch=scratch,
+            env=env,
+        )
+        lines_added = 0
+        lines_deleted = 0
+        for record in numstat.split(b"\0"):
+            parts = record.split(b"\t", 2)
+            if len(parts) != 3:
+                continue
+            if parts[0].isdigit():
+                lines_added += int(parts[0])
+            if parts[1].isdigit():
+                lines_deleted += int(parts[1])
+        return changed, lines_added, lines_deleted
+
+    def _bytes(
+        self,
+        args: list[str],
+        error: str,
+        *,
+        scratch: Path | None = None,
+        env: dict[str, str] | None = None,
+        input_bytes: bytes | None = None,
+    ) -> bytes:
+        try:
+            completed = run_git_bytes(
+                self.worktree,
+                self.repo_root,
+                args,
+                timeout=120,
+                scratch=scratch,
+                env=env,
+                input_bytes=input_bytes,
+            )
+        except SandboxUnavailable as exc:
+            raise EvaluationEngineError(f"sandbox_unavailable: {exc}") from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise EvaluationEngineError(f"git_unavailable: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise EvaluationEngineError(f"{error}: {detail}")
+        return completed.stdout
+
+    def _scratch_git(
+        self,
+        scratch: Path,
+        args: list[str],
+        *,
+        directory: str = ".",
+        input_bytes: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return run_scratch_git(
+                scratch,
+                args,
+                timeout=60,
+                directory=directory,
+                input_bytes=input_bytes,
+            )
+        except SandboxUnavailable as exc:
+            raise EvaluationEngineError(f"sandbox_unavailable: {exc}") from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise EvaluationEngineError(f"git_unavailable: {exc}") from exc
 
     def history_delta(self, before: dict[str, str], after: dict[str, str]) -> dict[str, int]:
         """Count commits and merges that only the post-validation refs can reach."""
@@ -474,6 +637,12 @@ class SubprocessGitExecutor:
             raise EvaluationEngineError(f"sandbox_unavailable: {exc}") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise EvaluationEngineError(f"git_unavailable: {exc}") from exc
+
+
+def _display_path(path: str) -> str:
+    """Make any filesystem path safe to store in UTF-8 JSON."""
+
+    return path.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
 def _ref_tips(state: dict[str, str]) -> set[str]:

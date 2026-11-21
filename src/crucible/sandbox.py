@@ -9,6 +9,7 @@ command: there is deliberately no host-execution fallback.
 from __future__ import annotations
 
 import os
+import re
 import resource
 import shutil
 import stat
@@ -24,11 +25,54 @@ from .schemas import CommandResult
 SANDBOX_WORKSPACE = "/workspace"
 SANDBOX_HOME = "/tmp/home"
 SANDBOX_SEED = "/.crucible-seed"
+SANDBOX_SCRATCH = "/.crucible-scratch"
 MAX_WORKSPACE_BYTES = 1024**3
 MAX_FILE_BYTES = 1024**3
-OUTPUT_TAIL_BYTES = 4096
+OUTPUT_TAIL_BYTES = 64 * 1024
 RO_PATHS_ENV = "CRUCIBLE_SANDBOX_RO_PATHS"
 DEFAULT_TOOLCHAIN_PATHS = ("/opt/python",)
+REDACTED = "[REDACTED]"
+_SECRET_NAME = (
+    r"[\w.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|credential)[\w.-]*"
+)
+_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?"
+            r"(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)",
+            re.DOTALL,
+        ),
+        REDACTED,
+    ),
+    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)[^\r\n]+"), rf"\1{REDACTED}"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), rf"\1 {REDACTED}"),
+    (re.compile(r"(?i)(://[^/\s:@]+:)[^/\s@]+(@)"), rf"\1{REDACTED}\2"),
+    (
+        re.compile(rf"(?i)(\b{_SECRET_NAME}[\"']?\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"),
+        rf"\1{REDACTED}",
+    ),
+    (
+        re.compile(
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+            r"sk-[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
+            r"xox[abeoprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|"
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b"
+        ),
+        REDACTED,
+    ),
+)
+_GIT_COMMAND = (
+    "/usr/bin/git",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.sparseCheckout=false",
+    "-c",
+    "protocol.allow=never",
+)
 _FORBIDDEN_RO_SEGMENTS = {
     ".aws",
     ".azure",
@@ -348,7 +392,15 @@ def _tail(handle) -> str:
     size = handle.seek(0, os.SEEK_END)
     handle.seek(max(0, size - OUTPUT_TAIL_BYTES))
     value = handle.read().decode("utf-8", errors="replace").replace("\x00", "")
-    return value[-2000:]
+    return _redact_summary(value)[-2000:]
+
+
+def _redact_summary(text: str) -> str:
+    """Mask common secret formats before command output is persisted."""
+
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def _common_git_dir(worktree: Path) -> tuple[Path, bool]:
@@ -385,6 +437,51 @@ def resolve_git_paths(worktree: Path, repo_root: Path | None = None) -> Path:
     return common
 
 
+def _execute_git(
+    command: Sequence[str],
+    input_bytes: bytes | None,
+    timeout: int,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        _scoped(command, DEFAULT_LIMITS),
+        input=input_bytes if input_bytes is not None else b"",
+        capture_output=True,
+        env=_scope_env(),
+        timeout=timeout,
+        check=False,
+    )
+
+
+def run_git_bytes(
+    worktree: Path,
+    repo_root: Path | None,
+    args: Sequence[str],
+    *,
+    timeout: int,
+    scratch: Path | None = None,
+    env: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run Git read-only and isolated, since repo config and filters can execute code."""
+
+    common = resolve_git_paths(worktree, repo_root)
+    command = _base_args(_find_bwrap(), toolchain_paths(), DEFAULT_LIMITS)
+    for path in sorted({str(worktree), str(common)}, key=len):
+        command.extend(["--ro-bind", path, path])
+    if scratch is not None:
+        command.extend(["--bind", str(scratch), SANDBOX_SCRATCH])
+    settings = {
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        **(env or {}),
+    }
+    for key, value in settings.items():
+        command.extend(["--setenv", key, value])
+    command.extend(["--chdir", str(worktree), "--", *_GIT_COMMAND, *args])
+    return _execute_git(command, input_bytes, timeout)
+
+
 def run_sandboxed_git(
     worktree: Path,
     repo_root: Path | None,
@@ -392,48 +489,52 @@ def run_sandboxed_git(
     *,
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    """Run Git read-only and isolated, since repo config and filters can execute code."""
+    """Run a sandboxed Git command and decode its output for display."""
 
-    common = resolve_git_paths(worktree, repo_root)
-    toolchains = toolchain_paths()
-    binds = sorted({str(worktree), str(common)}, key=len)
-    command = _base_args(_find_bwrap(), toolchains, DEFAULT_LIMITS)
-    for path in binds:
-        command.extend(["--ro-bind", path, path])
+    completed = run_git_bytes(worktree, repo_root, args, timeout=timeout)
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        completed.stdout.decode("utf-8", errors="replace"),
+        completed.stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def run_scratch_git(
+    scratch: Path,
+    args: Sequence[str],
+    *,
+    timeout: int,
+    directory: str = ".",
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run Git in a repository Crucible created, with no access to the attempt."""
+
+    command = _base_args(_find_bwrap(), toolchain_paths(), DEFAULT_LIMITS)
     command.extend(
         [
-            "--setenv",
-            "GIT_OPTIONAL_LOCKS",
-            "0",
-            "--setenv",
-            "GIT_NO_LAZY_FETCH",
-            "1",
-            "--setenv",
-            "GIT_NO_REPLACE_OBJECTS",
-            "1",
+            "--bind",
+            str(scratch),
+            SANDBOX_SCRATCH,
             "--chdir",
-            str(worktree),
+            f"{SANDBOX_SCRATCH}/{directory}",
             "--",
-            "/usr/bin/git",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "protocol.allow=never",
+            *_GIT_COMMAND,
             *args,
         ]
     )
-    return subprocess.run(
-        _scoped(command, DEFAULT_LIMITS),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        env=_scope_env(),
-        timeout=timeout,
-        check=False,
-    )
+    return _execute_git(command, input_bytes, timeout)
+
+
+def scratch_index_env(worktree: Path, repo_root: Path | None) -> dict[str, str]:
+    """Point Git at a disposable index and object store instead of the attempt's."""
+
+    common = resolve_git_paths(worktree, repo_root)
+    return {
+        "GIT_INDEX_FILE": f"{SANDBOX_SCRATCH}/index",
+        "GIT_OBJECT_DIRECTORY": f"{SANDBOX_SCRATCH}/objects",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(common / "objects"),
+    }
 
 
 def prepare_workspace(

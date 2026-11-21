@@ -112,6 +112,17 @@ properties before any command runs. Every Git call, including `create` and
 protocols disabled, because repository config and filters can execute code. Crucible fingerprints HEAD,
 refs, status, and file contents before and after validation; any change is a blocker.
 
+**Change detection:** Crucible compares raw files on disk with the baseline commit
+using a disposable index. It does not trust the attempt's index flags, `.git/info/*`,
+exclude settings, filters, or edited `.gitignore` files; only `.gitignore` files in the
+baseline define ignored output. Files under a prohibited path are blocked even when
+ignored. Repositories that rely on clean filters, such as Git LFS or line-ending
+conversion, may therefore report extra changes. Submodule contents are not inspected.
+
+**Output redaction:** stored command summaries mask common secret formats, including
+tokens, password assignments, authorization headers, URL credentials, and private keys.
+This is best effort, so treat stored output as potentially sensitive.
+
 **Resource limits:** sandboxed work runs in a systemd cgroup scope limited to 4 GiB of
 memory with no swap, 256 tasks, and 200% CPU. `/tmp` is limited to 1 GiB and the
 workspace to 2 GiB. Preflight reads the limits back from the kernel.
