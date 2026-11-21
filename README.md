@@ -9,11 +9,15 @@ operator approval. A crucible is the vessel where you test something's worth
 pass: it scores each attempt's quality **and** flags every boundary violation
 (secrets touched, out-of-scope edits, unauthorized pushes).
 
-It is entirely local. No network, no database, no external services, and — by
-construction — **no ability to send email, mutate a mailbox or CRM, submit a
-browser form, write secrets, or commit/merge/push Git.** Its report is
-trustworthy because the engine producing it cannot perform the side effects it
-attests to.
+It is entirely local: no network, database, or external services. Agent-controlled
+test and build commands run in a Bubblewrap sandbox on a disposable copy of the
+attempt. If that isolation cannot be established, Crucible refuses to run them.
+
+> **Security status:** Crucible is experimental and has not had a formal security
+> audit. For high-risk or unknown code, also run it inside a disposable VM. See
+> [SECURITY.md](SECURITY.md).
+
+Crucible is licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
@@ -70,14 +74,23 @@ baseline    one per         diff +      score +     terminal record
 | **register** | Records that an agent took a turn in a given worktree. One `ModelAttempt` per agent per run. |
 | **collect** | For each attempt: diffs the worktree against the baseline (tracked **and** untracked files), runs the required tests/builds, and evaluates the diff against the run's boundaries. Produces one `AttemptResult` per attempt. |
 | **compare** | Scores every attempt across multiple dimensions, recommends the best, and lists blockers. A boundary violation becomes a **blocker**, not merely a lower score. Always sets `operator_approval_required = true`. |
-| **closeout** | Writes the terminal `HarnessCloseout`: models observed, artifact paths, validation summary, your explicit `operator_decision`, and the HITL side-effect attestations — all of which are `false` because the engine cannot perform them. Marks the run `closed`. |
+| **closeout** | Writes the terminal `HarnessCloseout`: models observed, artifact paths, validation summary, your explicit `operator_decision`, and the evidence-based side-effect attestations. Marks the run `closed`. |
 
 ---
 
 ## The boundary model (the point of Crucible)
 
-Every result and every response carries the **`NO_SIDE_EFFECTS`** attestation
-block — a set of flags that are structurally always `false`:
+Every response carries an `attestations` block. Each side effect has one of three
+states, and Crucible never reports that something did not happen unless it can
+establish that:
+
+| Status | Meaning |
+|---|---|
+| `verified_absent` | Validation ran isolated and the repository was unchanged. |
+| `observed` | Crucible confirmed the side effect, such as a new commit. This blocks a recommendation. |
+| `unverified` | Crucible cannot establish either way. This also blocks a recommendation. |
+
+The covered keys are:
 
 ```
 outbound_email_sent            mailbox_mutated
@@ -87,8 +100,47 @@ git_commit_performed           git_merge_performed
 git_push_performed
 ```
 
-They are not runtime-computed guesses — the code paths to do these things do not
-exist in Crucible. The attestation is a *guarantee by construction*.
+Weaker evidence is reported separately in `boundary_signals`, as `true`, `false`, or
+`null` when unknown. `sensitive_path_changed` means a path matched a sensitive pattern;
+it does not prove a secret was written. `repository_history_changed` means HEAD or refs
+moved; it does not prove a commit was created. Both still block a recommendation.
+
+**Scope limit:** attestations cover Crucible's validation commands only
+(`attestation_scope: validation_commands`). Crucible does not watch the agent's own
+session, so `agent_session_covered` is always `false`. Run agents in their own
+sandbox if you need evidence about what they did before collection.
+
+**Isolation:** each command gets a fresh copy of tracked and untracked files, minus
+sensitive paths, with no network, no host home, no inherited credentials, no
+capabilities, and `no_new_privs`, so `sudo` cannot elevate. A preflight proves these
+properties before any command runs. Every Git call, including `create` and
+`register`, runs read-only in the sandbox with lazy fetch, replace refs, and transport
+protocols disabled, because repository config and filters can execute code. Crucible fingerprints HEAD,
+refs, status, and file contents before and after validation; any change is a blocker.
+
+**Change detection:** Crucible compares raw files on disk with the baseline commit
+using a disposable index. It does not trust the attempt's index flags, `.git/info/*`,
+exclude settings, filters, or edited `.gitignore` files; only `.gitignore` files in the
+baseline define ignored output. Files under a prohibited path are blocked even when
+ignored. Repositories that rely on clean filters, such as Git LFS or line-ending
+conversion, may therefore report extra changes. Submodule contents are not inspected.
+
+**Command output:** agent-controlled stdout and stderr are not stored by default.
+Results record only their byte counts. An operator can set
+`CRUCIBLE_PERSIST_REDACTED_OUTPUT=1` to store a redacted tail for debugging. Redaction
+masks common tokens, passwords, authorization headers, URL credentials, and private keys,
+but it is best effort, so treat that output as sensitive.
+
+**Resource limits:** sandboxed work runs in a systemd cgroup scope limited to 4 GiB of
+memory with no swap, 256 tasks, and 200% CPU. `/tmp` is limited to 1 GiB and the
+workspace to 2 GiB. Preflight reads the limits back from the kernel.
+
+Crucible requires Bubblewrap 0.8 or newer and a `systemd --user` session with the
+`memory`, `pids`, and `cpu` cgroup controllers delegated. If any are missing, it refuses
+to run Git or validation commands. `--repo` and `--worktree` must be checkout roots.
+Extra read-only toolchains can be exposed with the colon-separated
+`CRUCIBLE_SANDBOX_RO_PATHS`. Each entry must be a virtualenv or a toolchain with a `bin`
+directory under `/opt`; system directories and other paths are refused.
 
 Separately, each attempt's diff is checked against three path classes:
 
@@ -107,7 +159,7 @@ comparison blocker requiring operator review.
 ## Data model
 
 All records are dataclasses in `crucible.schemas`, serialized to JSON. Current
-`SCHEMA_VERSION = 2`; every record carries its own `schema_version`.
+`SCHEMA_VERSION = 3`; every record carries its own `schema_version`.
 
 **`HarnessRun`** — the run manifest
 `run_id · workspace · task_summary · repo_root · baseline_commit · baseline_ref ·
@@ -133,7 +185,7 @@ generated_at · schema_version`
 **`HarnessCloseout`** — the terminal record
 `entity_type · run_id · workspace · baseline_commit · task_summary ·
 models_observed · artifacts · validation · operator_decision · closed_at ·
-schema_version` (+ the `NO_SIDE_EFFECTS` attestation block on serialization)
+schema_version` (+ the evidence-based `attestations` block)
 
 Providers: `cursor · codex · claude · composer · gemini · local · other`.
 Run status: `active · completed · closed`.
@@ -182,8 +234,8 @@ crucible closeout RUN_ID [--decision approved] [--dry-run]
 crucible status   [RUN_ID]
 ```
 
-Test/build commands are parsed with `shlex` and executed **without shell
-expansion** (`shell=False`), so a task command cannot inject shell operators.
+Test/build commands are parsed with `shlex`, executed without shell expansion, and
+always run inside the sandbox.
 
 ---
 
@@ -239,15 +291,11 @@ an attempt.
 cd /path/to/Crucible
 python -m venv .venv && . .venv/bin/activate     # Python 3.11+ (3.14.x target)
 pip install -e .
-pytest                                            # 7 tests
+pytest                                            # requires bubblewrap and systemd --user
 crucible --help
 ```
 
-Verified on this box under Python **3.14.5**: editable install, `import crucible`,
-7/7 tests, CLI (`crucible` and `python -m crucible`), and a full
-`create → register → collect → compare → closeout` run against the live EVECOR
-repo (recommended `claude`, `operator_approval_required = true`, all boundary
-attestations `false`).
+CI runs lint and the full suite on Ubuntu with Bubblewrap under Python 3.14.
 
 ---
 
@@ -288,9 +336,10 @@ rewritten.
 ## Design guarantees
 
 - **Local-only.** Filesystem is the sole store. No DB, no network, no Datacore.
-- **No side effects.** The engine cannot email, mutate a mailbox/CRM/DB, submit a
-  browser form, write secrets, or commit/merge/push. The attestations are true by
-  construction, not by check.
+- **Evidence-based attestations.** A side effect is reported absent only when
+  isolation and before/after repository checks support it; otherwise it is
+  `observed` or `unverified` and blocks a recommendation.
+- **Fail closed.** Without a working sandbox, validation commands do not run.
 - **Operator-gated.** No attempt is ever auto-accepted; `operator_decision` is
   explicit and required.
 - **Tamper-evident inputs.** Sensitive paths are fingerprinted; artifacts are

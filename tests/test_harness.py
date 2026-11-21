@@ -15,7 +15,7 @@ from crucible import (
     record_harness_closeout,
     register_model_attempt,
 )
-from crucible.schemas import NO_SIDE_EFFECTS
+from crucible.schemas import ATTESTATION_KEYS
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def test_create_is_idempotent(repo: Path, runs_root: Path) -> None:
     manifest = json.loads(
         (runs_root / "run-1" / "manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["repo_root"] == str(repo.resolve())
 
 
@@ -124,11 +124,10 @@ def test_full_workflow_collects_uncommitted_and_untracked(
         operator_decision="accepted",
         runs_root=runs_root,
     )
-    assert closed["external_write_performed"] is False
     assert closed["closeout"]["operator_decision"] == "accepted"
     assert get_harness_status(run_id="run-1", runs_root=runs_root)["run"]["status"] == "closed"
-    for key, expected in NO_SIDE_EFFECTS.items():
-        assert closed["closeout"][key] is expected
+    for key in ATTESTATION_KEYS:
+        assert closed["closeout"]["attestations"][key]["status"] == "verified_absent"
 
 
 def test_segment_safe_scope_matching(repo: Path, runs_root: Path) -> None:

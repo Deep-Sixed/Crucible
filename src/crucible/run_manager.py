@@ -24,7 +24,8 @@ from .artifact_store import (
     write_baseline,
     write_manifest,
 )
-from .schemas import HarnessRun, ModelAttempt, NO_SIDE_EFFECTS, RunStatus, utc_now
+from .sandbox import SandboxUnavailable, run_sandboxed_git
+from .schemas import HarnessRun, ModelAttempt, RunStatus, unverified_attestations, utc_now
 
 PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -51,7 +52,7 @@ def create_harness_run(
 
     summary = _required_text(task_summary, "task_summary", max_length=1000)
     repo = Path(repo_root).resolve()
-    _validate_git_repo(repo)
+    _validate_git_repo(repo, repo)
     resolved_sha = _resolve_ref(baseline_ref, repo)
     root = (runs_root or default_runs_root()).resolve()
     rid = run_id or _generate_run_id()
@@ -89,7 +90,7 @@ def create_harness_run(
             "baseline_commit": resolved_sha,
             "run_dir": str(run_dir(root, rid)),
             "manifest": run.to_dict(),
-            **NO_SIDE_EFFECTS,
+            **unverified_attestations(),
         }
 
     with run_lock(root, rid):
@@ -109,7 +110,7 @@ def create_harness_run(
                 "run_id": rid,
                 "baseline_commit": resolved_sha,
                 "run_dir": str(run_dir(root, rid)),
-                **NO_SIDE_EFFECTS,
+                **unverified_attestations(),
             }
 
         written_manifest = write_manifest(run, root)
@@ -124,7 +125,7 @@ def create_harness_run(
         "run_dir": str(run_dir(root, rid)),
         "manifest_path": str(written_manifest),
         "baseline_path": str(baseline_path),
-        **NO_SIDE_EFFECTS,
+        **unverified_attestations(),
     }
 
 
@@ -143,11 +144,12 @@ def register_model_attempt(
     root = (runs_root or default_runs_root()).resolve()
     provider = _validate_provider(model_provider)
     worktree = Path(worktree_path).resolve()
-    _validate_git_repo(worktree)
 
     with run_lock(root, run_id):
         run = load_manifest(root, run_id)
-        _verify_commit_exists(worktree, run.baseline_commit)
+        repo = Path(run.repo_root) if run.repo_root else None
+        _validate_git_repo(worktree, repo)
+        _verify_commit_exists(worktree, run.baseline_commit, repo)
         aid = attempt_id or f"{provider}-{uuid.uuid4().hex[:8]}"
         try:
             validate_id(aid, "attempt_id")
@@ -167,7 +169,7 @@ def register_model_attempt(
                     "run_id": run_id,
                     "attempt_id": aid,
                     "attempt_path": str(path),
-                    **NO_SIDE_EFFECTS,
+                    **unverified_attestations(),
                 }
             raise RunManagerError(f"attempt_already_exists: {aid}")
 
@@ -187,7 +189,7 @@ def register_model_attempt(
         "run_id": run_id,
         "attempt_id": aid,
         "attempt_path": str(written),
-        **NO_SIDE_EFFECTS,
+        **unverified_attestations(),
     }
 
 
@@ -209,7 +211,7 @@ def get_harness_status(
             "result_count": len(results),
             "latest_comparison": comparison.to_dict() if comparison else None,
             "blockers": _collect_blockers(root, run_id),
-            **NO_SIDE_EFFECTS,
+            **unverified_attestations(),
         }
 
     runs: list[dict[str, Any]] = []
@@ -226,7 +228,7 @@ def get_harness_status(
                 "blockers": _collect_blockers(root, rid),
             }
         )
-    return {"ok": True, "runs": runs, **NO_SIDE_EFFECTS}
+    return {"ok": True, "runs": runs, **unverified_attestations()}
 
 
 def update_run_status(
@@ -300,45 +302,41 @@ def _normalize_scopes(paths: Sequence[str]) -> list[str]:
     return sorted(set(normalized))
 
 
-def _validate_git_repo(path: Path) -> None:
+def _git(
+    path: Path,
+    repo_root: Path | None,
+    args: list[str],
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return run_sandboxed_git(path, repo_root, args, timeout=15)
+    except SandboxUnavailable as exc:
+        raise RunManagerError(f"sandbox_unavailable: {exc}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunManagerError(f"git_unavailable: {exc}") from exc
+
+
+def _validate_git_repo(path: Path, repo_root: Path | None) -> None:
     if not path.is_dir():
         raise RunManagerError(f"repo_not_found: {path}")
-    result = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=path,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    result = _git(path, repo_root, ["rev-parse", "--is-inside-work-tree"])
     if result.returncode != 0 or result.stdout.strip() != "true":
         raise RunManagerError(f"not_a_git_worktree: {path}")
 
 
 def _resolve_ref(ref: str, repo: Path) -> str:
     normalized = _required_text(ref, "baseline_ref", max_length=256)
-    result = subprocess.run(
-        ["git", "rev-parse", f"{normalized}^{{commit}}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
+    result = _git(
+        repo,
+        repo,
+        ["rev-parse", "--verify", "--end-of-options", f"{normalized}^{{commit}}"],
     )
     if result.returncode != 0:
         raise RunManagerError(f"invalid_baseline_ref: {normalized}")
     return result.stdout.strip().lower()
 
 
-def _verify_commit_exists(worktree: Path, commit: str) -> None:
-    result = subprocess.run(
-        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+def _verify_commit_exists(worktree: Path, commit: str, repo_root: Path | None) -> None:
+    result = _git(worktree, repo_root, ["cat-file", "-e", f"{commit}^{{commit}}"])
     if result.returncode != 0:
         raise RunManagerError(
             f"baseline_commit_missing_from_worktree: {commit[:12]}: {worktree}"

@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, Self
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -37,17 +37,103 @@ class ModelProvider(StrEnum):
     OTHER = "other"
 
 
-NO_SIDE_EFFECTS: dict[str, bool] = {
-    "outbound_email_sent": False,
-    "mailbox_mutated": False,
-    "application_status_mutated": False,
-    "browser_submit_executed": False,
-    "secrets_written": False,
-    "database_mutated": False,
-    "git_commit_performed": False,
-    "git_merge_performed": False,
-    "git_push_performed": False,
+class AttestationStatus(StrEnum):
+    """What Crucible can actually establish about a side effect."""
+
+    VERIFIED_ABSENT = "verified_absent"
+    OBSERVED = "observed"
+    UNVERIFIED = "unverified"
+
+
+ATTESTATION_KEYS: tuple[str, ...] = (
+    "outbound_email_sent",
+    "mailbox_mutated",
+    "application_status_mutated",
+    "browser_submit_executed",
+    "secrets_written",
+    "database_mutated",
+    "git_commit_performed",
+    "git_merge_performed",
+    "git_push_performed",
+)
+
+BOUNDARY_SIGNAL_KEYS: tuple[str, ...] = (
+    "sensitive_path_changed",
+    "repository_history_changed",
+)
+
+_ATTESTATION_SEVERITY = {
+    AttestationStatus.VERIFIED_ABSENT.value: 0,
+    AttestationStatus.UNVERIFIED.value: 1,
+    AttestationStatus.OBSERVED.value: 2,
 }
+
+
+def unverified_attestation_items(
+    evidence: str = "no validation evidence for this record",
+) -> dict[str, dict[str, str]]:
+    return {
+        key: {"status": AttestationStatus.UNVERIFIED.value, "evidence": evidence}
+        for key in ATTESTATION_KEYS
+    }
+
+
+def unknown_boundary_signals() -> dict[str, bool | None]:
+    return {key: None for key in BOUNDARY_SIGNAL_KEYS}
+
+
+def aggregate_boundary_signals(
+    records: list[dict[str, bool | None]],
+) -> dict[str, bool | None]:
+    """Any true signal wins; otherwise a missing or unknown signal stays unknown."""
+
+    if not records:
+        return unknown_boundary_signals()
+    combined: dict[str, bool | None] = {}
+    for key in BOUNDARY_SIGNAL_KEYS:
+        values = [record.get(key) for record in records]
+        combined[key] = True if True in values else None if None in values else False
+    return combined
+
+
+def attestation_block(
+    items: dict[str, dict[str, str]],
+    signals: dict[str, bool | None] | None = None,
+) -> dict[str, Any]:
+    """Wrap attestations with their limits: agent activity before collection is not covered."""
+
+    return {
+        "attestation_scope": "validation_commands",
+        "agent_session_covered": False,
+        "attestations": items,
+        "boundary_signals": signals if signals is not None else unknown_boundary_signals(),
+    }
+
+
+def unverified_attestations() -> dict[str, Any]:
+    return {
+        "attestation_scope": "none",
+        "agent_session_covered": False,
+        "attestations": unverified_attestation_items(),
+        "boundary_signals": unknown_boundary_signals(),
+    }
+
+
+def aggregate_attestations(
+    records: list[dict[str, dict[str, str]]],
+) -> dict[str, dict[str, str]]:
+    """Return the worst state for each key; missing evidence is unverified."""
+
+    if not records:
+        return unverified_attestation_items()
+    combined: dict[str, dict[str, str]] = {}
+    fallback = {"status": AttestationStatus.UNVERIFIED.value, "evidence": "missing attestation"}
+    for key in ATTESTATION_KEYS:
+        entries = [record.get(key, fallback) for record in records]
+        combined[key] = dict(
+            max(entries, key=lambda item: _ATTESTATION_SEVERITY.get(item.get("status"), 1))
+        )
+    return combined
 
 SENSITIVE_PATH_PATTERNS: tuple[str, ...] = (
     ".env",
@@ -129,6 +215,7 @@ class CommandResult:
     duration_seconds: float
     summary: str
     timed_out: bool = False
+    sandboxed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -159,6 +246,11 @@ class AttemptResult:
     builds_total: int
     build_passed: bool | None
     collection_errors: list[str]
+    attestations: dict[str, dict[str, str]] = field(
+        default_factory=unverified_attestation_items
+    )
+    repository_mutations: list[str] = field(default_factory=list)
+    boundary_signals: dict[str, bool | None] = field(default_factory=unknown_boundary_signals)
     collected_at: str = field(default_factory=utc_now)
     schema_version: int = SCHEMA_VERSION
 
@@ -174,6 +266,9 @@ class AttemptResult:
         normalized.setdefault("builds_passed", 0)
         normalized.setdefault("builds_total", 0)
         normalized.setdefault("collection_errors", [])
+        normalized.setdefault("attestations", unverified_attestation_items())
+        normalized.setdefault("repository_mutations", [])
+        normalized.setdefault("boundary_signals", unknown_boundary_signals())
         normalized.setdefault("schema_version", 1)
         return cls(**_only_fields(cls, normalized))
 
@@ -213,11 +308,19 @@ class HarnessCloseout:
     artifacts: list[str]
     validation: dict[str, bool]
     operator_decision: str
+    attestations: dict[str, dict[str, str]] = field(
+        default_factory=unverified_attestation_items
+    )
+    boundary_signals: dict[str, bool | None] = field(default_factory=unknown_boundary_signals)
     closed_at: str = field(default_factory=utc_now)
     schema_version: int = SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), **NO_SIDE_EFFECTS}
+        return {
+            **asdict(self),
+            "attestation_scope": "validation_commands",
+            "agent_session_covered": False,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
