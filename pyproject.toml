@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Crucible — filesystem-backed multi-agent coding evaluation and boundary-attestation engine for EVECOR"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "Proprietary"}
+license = {text = "Apache-2.0"}
 authors = [{name = "EVECOR"}]
 dependencies = []
 

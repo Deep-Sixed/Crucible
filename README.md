@@ -13,6 +13,12 @@ It is entirely local: no network, database, or external services. Agent-controll
 test and build commands run in a Bubblewrap sandbox on a disposable copy of the
 attempt. If that isolation cannot be established, Crucible refuses to run them.
 
+> **Security status:** Crucible is experimental and has not had a formal security
+> audit. For high-risk or unknown code, also run it inside a disposable VM. See
+> [SECURITY.md](SECURITY.md).
+
+Crucible is licensed under the [Apache License 2.0](LICENSE).
+
 ---
 
 ## Table of contents
