@@ -57,6 +57,11 @@ ATTESTATION_KEYS: tuple[str, ...] = (
     "git_push_performed",
 )
 
+BOUNDARY_SIGNAL_KEYS: tuple[str, ...] = (
+    "sensitive_path_changed",
+    "repository_history_changed",
+)
+
 _ATTESTATION_SEVERITY = {
     AttestationStatus.VERIFIED_ABSENT.value: 0,
     AttestationStatus.UNVERIFIED.value: 1,
@@ -73,13 +78,35 @@ def unverified_attestation_items(
     }
 
 
-def attestation_block(items: dict[str, dict[str, str]]) -> dict[str, Any]:
+def unknown_boundary_signals() -> dict[str, bool | None]:
+    return {key: None for key in BOUNDARY_SIGNAL_KEYS}
+
+
+def aggregate_boundary_signals(
+    records: list[dict[str, bool | None]],
+) -> dict[str, bool | None]:
+    """Any true signal wins; otherwise a missing or unknown signal stays unknown."""
+
+    if not records:
+        return unknown_boundary_signals()
+    combined: dict[str, bool | None] = {}
+    for key in BOUNDARY_SIGNAL_KEYS:
+        values = [record.get(key) for record in records]
+        combined[key] = True if True in values else None if None in values else False
+    return combined
+
+
+def attestation_block(
+    items: dict[str, dict[str, str]],
+    signals: dict[str, bool | None] | None = None,
+) -> dict[str, Any]:
     """Wrap attestations with their limits: agent activity before collection is not covered."""
 
     return {
         "attestation_scope": "validation_commands",
         "agent_session_covered": False,
         "attestations": items,
+        "boundary_signals": signals if signals is not None else unknown_boundary_signals(),
     }
 
 
@@ -88,6 +115,7 @@ def unverified_attestations() -> dict[str, Any]:
         "attestation_scope": "none",
         "agent_session_covered": False,
         "attestations": unverified_attestation_items(),
+        "boundary_signals": unknown_boundary_signals(),
     }
 
 
@@ -222,6 +250,7 @@ class AttemptResult:
         default_factory=unverified_attestation_items
     )
     repository_mutations: list[str] = field(default_factory=list)
+    boundary_signals: dict[str, bool | None] = field(default_factory=unknown_boundary_signals)
     collected_at: str = field(default_factory=utc_now)
     schema_version: int = SCHEMA_VERSION
 
@@ -239,6 +268,7 @@ class AttemptResult:
         normalized.setdefault("collection_errors", [])
         normalized.setdefault("attestations", unverified_attestation_items())
         normalized.setdefault("repository_mutations", [])
+        normalized.setdefault("boundary_signals", unknown_boundary_signals())
         normalized.setdefault("schema_version", 1)
         return cls(**_only_fields(cls, normalized))
 
@@ -281,6 +311,7 @@ class HarnessCloseout:
     attestations: dict[str, dict[str, str]] = field(
         default_factory=unverified_attestation_items
     )
+    boundary_signals: dict[str, bool | None] = field(default_factory=unknown_boundary_signals)
     closed_at: str = field(default_factory=utc_now)
     schema_version: int = SCHEMA_VERSION
 

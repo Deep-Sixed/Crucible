@@ -19,6 +19,7 @@ from .schemas import (
     AttestationStatus,
     ComparisonResult,
     aggregate_attestations,
+    aggregate_boundary_signals,
     attestation_block,
     unverified_attestations,
 )
@@ -79,7 +80,7 @@ def compare_model_results(
         "scores": scores,
         "blockers": blockers,
         "task_summary": run.task_summary,
-        **attestation_block(_attestations(results)),
+        **attestation_block(_attestations(results), _signals(results)),
     }
 
 
@@ -100,12 +101,16 @@ def get_latest_comparison(
     return {
         "ok": True,
         "comparison": comparison.to_dict(),
-        **attestation_block(_attestations(results)),
+        **attestation_block(_attestations(results), _signals(results)),
     }
 
 
 def _attestations(results: list[AttemptResult]) -> dict[str, dict[str, str]]:
     return aggregate_attestations([result.attestations for result in results])
+
+
+def _signals(results: list[AttemptResult]) -> dict[str, bool | None]:
+    return aggregate_boundary_signals([result.boundary_signals for result in results])
 
 
 def _has_status(result: AttemptResult, status: AttestationStatus) -> bool:

@@ -32,8 +32,12 @@ from .schemas import (
     RunStatus,
     SENSITIVE_PATH_PATTERNS,
     aggregate_attestations,
+    aggregate_boundary_signals,
     attestation_block,
 )
+
+
+HISTORY_MUTATIONS = frozenset({"head_changed", "refs_changed"})
 
 
 class EvaluationEngineError(ValueError):
@@ -44,6 +48,10 @@ class GitExecutor(Protocol):
     def snapshot(self, baseline_sha: str) -> dict[str, Any]: ...
 
     def state(self) -> tuple[dict[str, str], list[str]]: ...
+
+    def history_delta(
+        self, before: dict[str, str], after: dict[str, str]
+    ) -> dict[str, int]: ...
 
 
 class CommandRunner(Protocol):
@@ -67,6 +75,7 @@ def collect_run_results(
 
     collected: list[dict[str, Any]] = []
     attestations: list[dict[str, Any]] = []
+    signals: list[dict[str, bool | None]] = []
     runner = command_runner or BubblewrapCommandRunner()
     sandbox_error = _preflight(runner) if run.required_tests or run.required_builds else None
 
@@ -81,6 +90,7 @@ def collect_run_results(
             result = _collect_attempt(run, attempt, executor, runner, sandbox_error)
             path = write_attempt_result(result, root)
             attestations.append(result.attestations)
+            signals.append(result.boundary_signals)
             collected.append(
                 {
                     "attempt_id": attempt.attempt_id,
@@ -96,6 +106,7 @@ def collect_run_results(
                     "builds_total": result.builds_total,
                     "collection_errors": result.collection_errors,
                     "repository_mutations": result.repository_mutations,
+                    "boundary_signals": result.boundary_signals,
                 }
             )
 
@@ -104,7 +115,10 @@ def collect_run_results(
         "ok": True,
         "run_id": run_id,
         "collected": collected,
-        **attestation_block(aggregate_attestations(attestations)),
+        **attestation_block(
+            aggregate_attestations(attestations),
+            aggregate_boundary_signals(signals),
+        ),
     }
 
 
@@ -168,15 +182,23 @@ def _collect_attempt(
         for command in run.required_builds
     ]
 
-    mutations = _detect_mutations(executor, before, errors)
+    mutations, after = _detect_mutations(executor, before, errors)
+    history_changed = bool(HISTORY_MUTATIONS.intersection(mutations))
+    history = _history_delta(executor, before, after) if history_changed else None
+    state_verified = before is not None and after is not None
     command_results = [*test_results, *build_results]
     attestations = _build_attestations(
         command_results=command_results,
         runner=runner,
-        state_verified=before is not None and "state_after_unavailable" not in mutations,
+        state_verified=state_verified,
         mutations=mutations,
         sensitive_found=bool(sensitive_raw),
+        history=history,
     )
+    boundary_signals: dict[str, bool | None] = {
+        "sensitive_path_changed": bool(sensitive_raw) if before is not None else None,
+        "repository_history_changed": history_changed if state_verified else None,
+    }
 
     tests_passed = sum(bool(result["passed"]) for result in test_results)
     builds_passed = sum(bool(result["passed"]) for result in build_results)
@@ -206,6 +228,7 @@ def _collect_attempt(
         collection_errors=errors,
         attestations=attestations,
         repository_mutations=mutations,
+        boundary_signals=boundary_signals,
     )
 
 
@@ -247,15 +270,29 @@ def _detect_mutations(
     executor: GitExecutor,
     before: dict[str, str] | None,
     errors: list[str],
-) -> list[str]:
+) -> tuple[list[str], dict[str, str] | None]:
     if before is None:
-        return []
+        return [], None
     try:
         after, _files = executor.state()
     except EvaluationEngineError as exc:
         errors.append(str(exc))
-        return ["state_after_unavailable"]
-    return [f"{key}_changed" for key in sorted(before) if before[key] != after.get(key)]
+        return ["state_after_unavailable"], None
+    changed = [f"{key}_changed" for key in sorted(before) if before[key] != after.get(key)]
+    return changed, after
+
+
+def _history_delta(
+    executor: GitExecutor,
+    before: dict[str, str] | None,
+    after: dict[str, str] | None,
+) -> dict[str, int] | None:
+    if before is None or after is None:
+        return None
+    try:
+        return executor.history_delta(before, after)
+    except (EvaluationEngineError, AttributeError, ValueError):
+        return None
 
 
 def _build_attestations(
@@ -265,12 +302,12 @@ def _build_attestations(
     state_verified: bool,
     mutations: list[str],
     sensitive_found: bool,
+    history: dict[str, int] | None,
 ) -> dict[str, dict[str, str]]:
     isolated = bool(getattr(runner, "isolated", False)) and all(
         result.get("sandboxed") for result in command_results
     )
     verified = isolated and state_verified
-    history_changed = bool({"head_changed", "refs_changed"}.intersection(mutations))
     if not command_results:
         absent_evidence = "no validation commands ran"
     else:
@@ -289,15 +326,20 @@ def _build_attestations(
             evidence = absent_evidence
         items[key] = {"status": status.value, "evidence": evidence}
 
-    if history_changed:
+    if history and history["commits"] > 0:
         items["git_commit_performed"] = {
             "status": AttestationStatus.OBSERVED.value,
-            "evidence": "HEAD or refs changed during validation",
+            "evidence": f"{history['commits']} new commit(s) reachable from changed refs",
+        }
+    if history and history["merges"] > 0:
+        items["git_merge_performed"] = {
+            "status": AttestationStatus.OBSERVED.value,
+            "evidence": f"{history['merges']} new merge commit(s) reachable from changed refs",
         }
     if sensitive_found:
         items["secrets_written"] = {
-            "status": AttestationStatus.OBSERVED.value,
-            "evidence": "attempt diff contains a sensitive path",
+            "status": AttestationStatus.UNVERIFIED.value,
+            "evidence": "a sensitive path changed; its contents were not inspected",
         }
     return items
 
@@ -398,12 +440,26 @@ class SubprocessGitExecutor:
         return (
             {
                 "head": head.strip(),
-                "refs": _digest(refs),
+                "refs": refs,
                 "status": _digest(status),
                 "content": _content_digest(self.worktree, files),
             },
             files,
         )
+
+    def history_delta(self, before: dict[str, str], after: dict[str, str]) -> dict[str, int]:
+        """Count commits and merges that only the post-validation refs can reach."""
+
+        known = _ref_tips(before)
+        new_tips = sorted(_ref_tips(after) - known)
+        if not new_tips:
+            return {"commits": 0, "merges": 0}
+        selection = [*new_tips, "--not", *sorted(known)]
+        commits = self._checked(["rev-list", "--count", *selection], "git_history_failed")
+        merges = self._checked(
+            ["rev-list", "--count", "--merges", *selection], "git_history_failed"
+        )
+        return {"commits": int(commits.strip()), "merges": int(merges.strip())}
 
     def _checked(self, args: list[str], error: str) -> str:
         completed = self._git(args, timeout=60)
@@ -418,6 +474,12 @@ class SubprocessGitExecutor:
             raise EvaluationEngineError(f"sandbox_unavailable: {exc}") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise EvaluationEngineError(f"git_unavailable: {exc}") from exc
+
+
+def _ref_tips(state: dict[str, str]) -> set[str]:
+    tips = {line.split(" ", 1)[0] for line in state["refs"].splitlines() if line}
+    tips.add(state["head"])
+    return tips
 
 
 def _digest(value: str) -> str:

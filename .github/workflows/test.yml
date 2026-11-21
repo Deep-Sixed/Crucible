@@ -20,6 +20,14 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
       - name: Allow unprivileged user namespaces for bubblewrap
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Start a user systemd session for cgroup limits
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 30); do [ -S "$runtime/bus" ] && break; sleep 1; done
+          test -S "$runtime/bus"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
       - name: Install test tools
         run: python -m pip install --quiet pytest ruff==0.15.14
       - name: Lint

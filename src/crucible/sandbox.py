@@ -15,6 +15,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Sequence
 
@@ -22,7 +23,8 @@ from .schemas import CommandResult
 
 SANDBOX_WORKSPACE = "/workspace"
 SANDBOX_HOME = "/tmp/home"
-MAX_WORKSPACE_BYTES = 2 * 1024**3
+SANDBOX_SEED = "/.crucible-seed"
+MAX_WORKSPACE_BYTES = 1024**3
 MAX_FILE_BYTES = 1024**3
 OUTPUT_TAIL_BYTES = 4096
 RO_PATHS_ENV = "CRUCIBLE_SANDBOX_RO_PATHS"
@@ -38,6 +40,20 @@ _FORBIDDEN_RO_SEGMENTS = {
     ".password-store",
     ".ssh",
 }
+
+
+@dataclass(frozen=True)
+class ResourceLimits:
+    """Cgroup and tmpfs limits applied to everything agent-controlled."""
+
+    memory_bytes: int = 4 * 1024**3
+    tasks: int = 256
+    cpu_percent: int = 200
+    tmp_bytes: int = 1024**3
+    workspace_bytes: int = 2 * 1024**3
+
+
+DEFAULT_LIMITS = ResourceLimits()
 
 
 class SandboxUnavailable(RuntimeError):
@@ -72,7 +88,7 @@ def _sandbox_path(toolchains: Sequence[str]) -> str:
     return ":".join(dict.fromkeys(entries))
 
 
-def _base_args(bwrap: str, toolchains: Sequence[str]) -> list[str]:
+def _base_args(bwrap: str, toolchains: Sequence[str], limits: ResourceLimits) -> list[str]:
     args = [
         bwrap,
         "--unshare-all",
@@ -104,6 +120,8 @@ def _base_args(bwrap: str, toolchains: Sequence[str]) -> list[str]:
             "/proc",
             "--dev",
             "/dev",
+            "--size",
+            str(limits.tmp_bytes),
             "--tmpfs",
             "/tmp",
             "--dir",
@@ -141,39 +159,132 @@ def _find_bwrap() -> str:
     return bwrap
 
 
+def _scope_env() -> dict[str, str]:
+    """Return only what systemd-run needs; bubblewrap clears it before agent code runs."""
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(Path.home()),
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        or f"unix:path={runtime}/bus",
+    }
+
+
+def _scoped(command: Sequence[str], limits: ResourceLimits) -> list[str]:
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise SandboxUnavailable("systemd_run_not_installed")
+    return [
+        systemd_run,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--property=MemoryMax={limits.memory_bytes}",
+        "--property=MemorySwapMax=0",
+        f"--property=TasksMax={limits.tasks}",
+        f"--property=CPUQuota={limits.cpu_percent}%",
+        "--",
+        *command,
+    ]
+
+
+def read_scope_limits(limits: ResourceLimits = DEFAULT_LIMITS) -> dict[str, str]:
+    """Read the limits the kernel actually applied to a scope."""
+
+    script = (
+        'c=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); '
+        'cat "$c/memory.max" "$c/pids.max" "$c/cpu.max"; '
+        'cat "$c/memory.swap.max" 2>/dev/null || echo absent'
+    )
+    try:
+        completed = subprocess.run(
+            _scoped(["/bin/sh", "-c", script], limits),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=_scope_env(),
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxUnavailable(f"cgroup_scope_failed: {exc}") from exc
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or len(lines) != 4:
+        raise SandboxUnavailable(f"cgroup_scope_failed: {completed.stderr.strip()[:200]}")
+    return {"memory": lines[0], "tasks": lines[1], "cpu": lines[2], "swap": lines[3]}
+
+
+def _verify_scope(limits: ResourceLimits) -> None:
+    actual = read_scope_limits(limits)
+    expected = {
+        "memory": str(limits.memory_bytes),
+        "tasks": str(limits.tasks),
+        "cpu": f"{limits.cpu_percent * 1000} 100000",
+    }
+    for key, value in expected.items():
+        if actual[key] != value:
+            raise SandboxUnavailable(f"cgroup_limit_not_applied: {key}")
+    if actual["swap"] not in {"0", "absent"}:
+        raise SandboxUnavailable("cgroup_limit_not_applied: swap")
+
+
 class BubblewrapCommandRunner:
     """Run commands in a network-less, credential-less, no-new-privileges sandbox."""
 
     isolated = True
 
-    def __init__(self, timeout_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        timeout_seconds: int = 300,
+        limits: ResourceLimits = DEFAULT_LIMITS,
+    ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.limits = limits
 
     def preflight(self) -> None:
         """Prove the isolation properties before any agent-controlled code runs."""
 
         bwrap = _find_bwrap()
         toolchains = toolchain_paths()
+        _verify_scope(self.limits)
         script = (
             'grep -Eq "^NoNewPrivs:[[:space:]]*1$" /proc/self/status || exit 11; '
             'grep -Eq "^CapEff:[[:space:]]*0+$" /proc/self/status || exit 12; '
             '[ "$(grep -c : /proc/net/dev)" = 1 ] || exit 13; '
             '[ ! -e "$1" ] || exit 14; '
             "[ ! -e /etc/sudoers ] || exit 15; "
-            "[ ! -e /run ] || exit 16"
+            "[ ! -e /run ] || exit 16; "
+            'grep -Eq "^tmpfs /tmp tmpfs .*size=" /proc/mounts || exit 17; '
+            'grep -Eq "^tmpfs /workspace tmpfs .*size=" /proc/mounts || exit 18'
         )
-        argv = [
-            *_base_args(bwrap, toolchains),
-            "--",
-            "/bin/sh",
-            "-c",
-            script,
-            "crucible-preflight",
-            str(Path.home()),
-        ]
+        argv = _scoped(
+            [
+                *_base_args(bwrap, toolchains, self.limits),
+                "--size",
+                str(self.limits.workspace_bytes),
+                "--tmpfs",
+                SANDBOX_WORKSPACE,
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+                "crucible-preflight",
+                str(Path.home()),
+            ],
+            self.limits,
+        )
         try:
             completed = subprocess.run(
-                argv, capture_output=True, text=True, timeout=20, check=False
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=_scope_env(),
+                timeout=20,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise SandboxUnavailable(f"preflight_failed: {exc}") from exc
@@ -184,16 +295,27 @@ class BubblewrapCommandRunner:
     def run(self, argv: Sequence[str], cwd: Path) -> CommandResult:
         if not argv:
             raise ValueError("empty_command")
-        command = [
-            *_base_args(_find_bwrap(), toolchain_paths()),
-            "--bind",
-            str(cwd),
-            SANDBOX_WORKSPACE,
-            "--chdir",
-            SANDBOX_WORKSPACE,
-            "--",
-            *argv,
-        ]
+        command = _scoped(
+            [
+                *_base_args(_find_bwrap(), toolchain_paths(), self.limits),
+                "--ro-bind",
+                str(cwd),
+                SANDBOX_SEED,
+                "--size",
+                str(self.limits.workspace_bytes),
+                "--tmpfs",
+                SANDBOX_WORKSPACE,
+                "--chdir",
+                SANDBOX_WORKSPACE,
+                "--",
+                "/bin/sh",
+                "-c",
+                'cp -a "$0"/. . && exec "$@"',
+                SANDBOX_SEED,
+                *argv,
+            ],
+            self.limits,
+        )
         started = time.monotonic()
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             try:
@@ -202,6 +324,7 @@ class BubblewrapCommandRunner:
                     stdin=subprocess.DEVNULL,
                     stdout=stdout,
                     stderr=stderr,
+                    env=_scope_env(),
                     timeout=self.timeout_seconds,
                     check=False,
                     preexec_fn=_limit_child,
@@ -274,7 +397,7 @@ def run_sandboxed_git(
     common = resolve_git_paths(worktree, repo_root)
     toolchains = toolchain_paths()
     binds = sorted({str(worktree), str(common)}, key=len)
-    command = _base_args(_find_bwrap(), toolchains)
+    command = _base_args(_find_bwrap(), toolchains, DEFAULT_LIMITS)
     for path in binds:
         command.extend(["--ro-bind", path, path])
     command.extend(
@@ -282,6 +405,12 @@ def run_sandboxed_git(
             "--setenv",
             "GIT_OPTIONAL_LOCKS",
             "0",
+            "--setenv",
+            "GIT_NO_LAZY_FETCH",
+            "1",
+            "--setenv",
+            "GIT_NO_REPLACE_OBJECTS",
+            "1",
             "--chdir",
             str(worktree),
             "--",
@@ -290,15 +419,18 @@ def run_sandboxed_git(
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "protocol.allow=never",
             *args,
         ]
     )
     return subprocess.run(
-        command,
+        _scoped(command, DEFAULT_LIMITS),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         errors="replace",
+        env=_scope_env(),
         timeout=timeout,
         check=False,
     )

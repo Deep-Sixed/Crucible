@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 from pathlib import Path
@@ -15,7 +16,13 @@ from crucible import (
     record_harness_closeout,
     register_model_attempt,
 )
-from crucible.sandbox import BubblewrapCommandRunner, SandboxUnavailable
+from crucible.run_manager import RunManagerError
+from crucible.sandbox import (
+    BubblewrapCommandRunner,
+    ResourceLimits,
+    SandboxUnavailable,
+    read_scope_limits,
+)
 from crucible.schemas import ATTESTATION_KEYS, CommandResult
 
 
@@ -40,10 +47,12 @@ def runs_root(tmp_path: Path) -> Path:
     return tmp_path / "runs"
 
 
-def run_attempt(repo: Path, runs_root: Path, command: list[str], **collect_kwargs):
+def setup_attempt(
+    repo: Path, runs_root: Path, command: list[str], baseline_ref: str = "HEAD"
+) -> None:
     create_harness_run(
         task_summary="Isolation regression",
-        baseline_ref="HEAD",
+        baseline_ref=baseline_ref,
         repo_root=repo,
         runs_root=runs_root,
         run_id="run-1",
@@ -58,6 +67,20 @@ def run_attempt(repo: Path, runs_root: Path, command: list[str], **collect_kwarg
         attempt_id="probe-1",
         runs_root=runs_root,
     )
+
+
+def run_attempt(
+    repo: Path,
+    runs_root: Path,
+    command: list[str],
+    baseline_ref: str = "HEAD",
+    **collect_kwargs,
+):
+    setup_attempt(repo, runs_root, command, baseline_ref)
+    return collect_attempt(runs_root, **collect_kwargs)
+
+
+def collect_attempt(runs_root: Path, **collect_kwargs):
     collected = collect_run_results(run_id="run-1", runs_root=runs_root, **collect_kwargs)
     payload = json.loads(
         (runs_root / "run-1" / "attempts" / "probe-1_result.json").read_text(encoding="utf-8")
@@ -168,8 +191,9 @@ def test_missing_sandbox_fails_closed(
     repo: Path, runs_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     marker = tmp_path / "ran-on-host"
+    setup_attempt(repo, runs_root, ["touch", str(marker)])
     monkeypatch.setattr("crucible.sandbox.shutil.which", lambda _name: None)
-    collected, payload = run_attempt(repo, runs_root, ["touch", str(marker)])
+    collected, payload = collect_attempt(runs_root)
     assert not marker.exists()
     assert payload["test_results"][0]["returncode"] == 126
     assert payload["test_results"][0]["sandboxed"] is False
@@ -243,3 +267,233 @@ def test_clean_attempt_is_verified_only_for_validation_scope(
         for key in ATTESTATION_KEYS
     )
     assert "git_commit_performed" not in collected
+
+
+def make_repo(path: Path, content: str) -> str:
+    path.mkdir()
+    for args in (
+        ["init"],
+        ["config", "user.email", "test@example.com"],
+        ["config", "user.name", "Test"],
+    ):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    (path / "file.txt").write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "commit"], cwd=path, check=True)
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=path, text=True).strip()
+
+
+def make_promisor_repo(path: Path, tmp_path: Path, marker: Path) -> None:
+    make_repo(path, "attacker\n")
+    remote = tmp_path / f"{path.name}-remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    payload = tmp_path / f"{path.name}-payload.sh"
+    payload.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n", encoding="utf-8")
+    payload.chmod(0o755)
+    for key, value in (
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.url", str(remote)),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialclonefilter", "blob:none"),
+        ("remote.origin.uploadpack", str(payload)),
+    ):
+        subprocess.run(["git", "config", key, value], cwd=path, check=True)
+
+
+def test_promisor_repo_cannot_execute_during_register(
+    repo: Path, runs_root: Path, tmp_path: Path
+) -> None:
+    marker = tmp_path / "executed-at-register"
+    evil = tmp_path / "evil-register"
+    make_promisor_repo(evil, tmp_path, marker)
+    created = create_harness_run(
+        task_summary="Malicious worktree",
+        baseline_ref="HEAD",
+        repo_root=repo,
+        runs_root=runs_root,
+        run_id="run-1",
+    )
+    with pytest.raises(RunManagerError):
+        register_model_attempt(
+            run_id=created["run_id"],
+            model_provider="local",
+            model_name="probe",
+            ide_host="pytest",
+            worktree_path=evil,
+            attempt_id="probe-1",
+            runs_root=runs_root,
+        )
+    assert not marker.exists()
+
+
+def test_promisor_repo_cannot_execute_during_create(
+    repo: Path, runs_root: Path, tmp_path: Path
+) -> None:
+    marker = tmp_path / "executed-at-create"
+    evil = tmp_path / "evil-create"
+    make_promisor_repo(evil, tmp_path, marker)
+    missing = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    with pytest.raises(RunManagerError):
+        create_harness_run(
+            task_summary="Malicious repo",
+            baseline_ref=missing,
+            repo_root=evil,
+            runs_root=runs_root,
+            run_id="run-1",
+        )
+    assert not marker.exists()
+
+
+def test_no_module_invokes_git_directly() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "src" / "crucible"
+    offenders = []
+    for path in source_root.glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.List)
+                and node.elts
+                and isinstance(node.elts[0], ast.Constant)
+                and node.elts[0].value == "git"
+            ):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert offenders == []
+
+
+def test_replace_refs_cannot_hide_changes(repo: Path, runs_root: Path) -> None:
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "change"], cwd=repo, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    subprocess.run(["git", "replace", baseline, head], cwd=repo, check=True)
+    _collected, payload = run_attempt(
+        repo, runs_root, python_check("pass"), baseline_ref=baseline
+    )
+    assert "README.md" in payload["files_changed"]
+
+
+def test_sensitive_path_is_a_signal_not_a_confirmed_secret(
+    repo: Path, runs_root: Path
+) -> None:
+    (repo / "docs").mkdir()
+    (repo / "docs" / "setup.environment.md").write_text("plain docs\n", encoding="utf-8")
+    collected, _payload = run_attempt(repo, runs_root, python_check("pass"))
+    assert collected["attestations"]["secrets_written"]["status"] == "unverified"
+    assert collected["boundary_signals"]["sensitive_path_changed"] is True
+    comparison = compare_model_results(run_id="run-1", runs_root=runs_root)
+    assert comparison["recommended_attempt_id"] is None
+    assert "sensitive_paths_in_diff" in comparison["blockers"]
+
+
+def test_ref_deletion_is_history_change_not_commit(repo: Path, runs_root: Path) -> None:
+    subprocess.run(["git", "branch", "stale"], cwd=repo, check=True)
+
+    class RefDeletingRunner:
+        isolated = True
+
+        def run(self, argv, cwd):
+            subprocess.run(["git", "branch", "-qD", "stale"], cwd=repo, check=True)
+            return CommandResult(list(argv), True, 0, 0.0, "", sandboxed=True)
+
+    collected, _payload = run_attempt(
+        repo, runs_root, ["true"], command_runner=RefDeletingRunner()
+    )
+    assert collected["attestations"]["git_commit_performed"]["status"] == "unverified"
+    assert collected["boundary_signals"]["repository_history_changed"] is True
+    comparison = compare_model_results(run_id="run-1", runs_root=runs_root)
+    assert comparison["recommended_attempt_id"] is None
+    assert "repository_mutated_during_validation" in comparison["blockers"]
+
+
+def test_merge_during_validation_is_observed(repo: Path, runs_root: Path) -> None:
+    default = subprocess.check_output(
+        ["git", "branch", "--show-current"], cwd=repo, text=True
+    ).strip()
+
+    class MergingRunner:
+        isolated = True
+
+        def run(self, argv, cwd):
+            for args in (
+                ["switch", "-qc", "side"],
+                ["commit", "--allow-empty", "-qm", "side"],
+                ["switch", "-q", default],
+                ["commit", "--allow-empty", "-qm", "main"],
+                ["merge", "-q", "--no-edit", "side"],
+            ):
+                subprocess.run(["git", *args], cwd=repo, check=True)
+            return CommandResult(list(argv), True, 0, 0.0, "", sandboxed=True)
+
+    collected, _payload = run_attempt(repo, runs_root, ["true"], command_runner=MergingRunner())
+    assert collected["attestations"]["git_commit_performed"]["status"] == "observed"
+    assert collected["attestations"]["git_merge_performed"]["status"] == "observed"
+
+
+def test_cgroup_limits_are_applied_by_kernel() -> None:
+    limits = ResourceLimits(memory_bytes=256 * 1024**2, tasks=64, cpu_percent=50)
+    actual = read_scope_limits(limits)
+    assert actual["memory"] == str(limits.memory_bytes)
+    assert actual["tasks"] == "64"
+    assert actual["cpu"] == "50000 100000"
+    assert actual["swap"] in {"0", "absent"}
+
+
+def test_process_limit_is_enforced(repo: Path, runs_root: Path) -> None:
+    source = (
+        "import threading\n"
+        "stop = threading.Event()\n"
+        "try:\n"
+        "    for _ in range(200):\n"
+        "        threading.Thread(target=stop.wait, daemon=True).start()\n"
+        "except RuntimeError:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(9)\n"
+    )
+    runner = BubblewrapCommandRunner(limits=ResourceLimits(tasks=32))
+    _collected, payload = run_attempt(
+        repo, runs_root, python_check(source), command_runner=runner
+    )
+    assert payload["tests_passed"] == 1, payload["test_results"][0]["summary"]
+
+
+def test_memory_limit_is_enforced(repo: Path, runs_root: Path) -> None:
+    source = "data = bytearray(b'x') * (768 * 1024 * 1024); print(len(data))"
+    runner = BubblewrapCommandRunner(limits=ResourceLimits(memory_bytes=128 * 1024**2))
+    _collected, payload = run_attempt(
+        repo, runs_root, python_check(source), command_runner=runner
+    )
+    assert payload["tests_passed"] == 0
+
+
+@pytest.mark.parametrize("target", ["/tmp/fill", "/workspace/fill"])
+def test_tmpfs_limits_are_enforced(repo: Path, runs_root: Path, target: str) -> None:
+    source = (
+        "try:\n"
+        f"    open({target!r}, 'wb').write(b'x' * (8 * 1024 * 1024))\n"
+        "except OSError:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(9)\n"
+    )
+    limits = ResourceLimits(tmp_bytes=2 * 1024**2, workspace_bytes=2 * 1024**2)
+    _collected, payload = run_attempt(
+        repo,
+        runs_root,
+        python_check(source),
+        command_runner=BubblewrapCommandRunner(limits=limits),
+    )
+    assert payload["tests_passed"] == 1, payload["test_results"][0]["summary"]
+
+
+def test_missing_cgroup_support_fails_closed(
+    repo: Path, runs_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "ran-without-limits"
+    setup_attempt(repo, runs_root, ["touch", str(marker)])
+    real_which = __import__("shutil").which
+    monkeypatch.setattr(
+        "crucible.sandbox.shutil.which",
+        lambda name: None if name == "systemd-run" else real_which(name),
+    )
+    _collected, payload = collect_attempt(runs_root)
+    assert not marker.exists()
+    assert payload["test_results"][0]["returncode"] == 126

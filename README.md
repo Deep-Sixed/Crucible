@@ -81,7 +81,7 @@ establish that:
 | Status | Meaning |
 |---|---|
 | `verified_absent` | Validation ran isolated and the repository was unchanged. |
-| `observed` | Crucible saw the side effect. This blocks a recommendation. |
+| `observed` | Crucible confirmed the side effect, such as a new commit. This blocks a recommendation. |
 | `unverified` | Crucible cannot establish either way. This also blocks a recommendation. |
 
 The covered keys are:
@@ -94,6 +94,11 @@ git_commit_performed           git_merge_performed
 git_push_performed
 ```
 
+Weaker evidence is reported separately in `boundary_signals`, as `true`, `false`, or
+`null` when unknown. `sensitive_path_changed` means a path matched a sensitive pattern;
+it does not prove a secret was written. `repository_history_changed` means HEAD or refs
+moved; it does not prove a commit was created. Both still block a recommendation.
+
 **Scope limit:** attestations cover Crucible's validation commands only
 (`attestation_scope: validation_commands`). Crucible does not watch the agent's own
 session, so `agent_session_covered` is always `false`. Run agents in their own
@@ -102,13 +107,20 @@ sandbox if you need evidence about what they did before collection.
 **Isolation:** each command gets a fresh copy of tracked and untracked files, minus
 sensitive paths, with no network, no host home, no inherited credentials, no
 capabilities, and `no_new_privs`, so `sudo` cannot elevate. A preflight proves these
-properties before any command runs. Git reads also run read-only in the sandbox,
-because repository config and filters can execute code. Crucible fingerprints HEAD,
+properties before any command runs. Every Git call, including `create` and
+`register`, runs read-only in the sandbox with lazy fetch, replace refs, and transport
+protocols disabled, because repository config and filters can execute code. Crucible fingerprints HEAD,
 refs, status, and file contents before and after validation; any change is a blocker.
 
-Bubblewrap is required when a run has test or build commands. Extra read-only
-toolchains, such as a virtualenv, can be exposed with the colon-separated
-`CRUCIBLE_SANDBOX_RO_PATHS`. CPU, memory, and process counts are not yet limited.
+**Resource limits:** sandboxed work runs in a systemd cgroup scope limited to 4 GiB of
+memory with no swap, 256 tasks, and 200% CPU. `/tmp` is limited to 1 GiB and the
+workspace to 2 GiB. Preflight reads the limits back from the kernel.
+
+Crucible requires Bubblewrap 0.8 or newer and a `systemd --user` session with the
+`memory`, `pids`, and `cpu` cgroup controllers delegated. If any are missing, it refuses
+to run Git or validation commands. `--repo` and `--worktree` must be checkout roots.
+Extra read-only toolchains, such as a virtualenv, can be exposed with the colon-separated
+`CRUCIBLE_SANDBOX_RO_PATHS`.
 
 Separately, each attempt's diff is checked against three path classes:
 
@@ -259,7 +271,7 @@ an attempt.
 cd /path/to/Crucible
 python -m venv .venv && . .venv/bin/activate     # Python 3.11+ (3.14.x target)
 pip install -e .
-pytest                                            # requires bubblewrap
+pytest                                            # requires bubblewrap and systemd --user
 crucible --help
 ```
 
