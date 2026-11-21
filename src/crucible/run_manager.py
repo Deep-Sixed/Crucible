@@ -24,7 +24,7 @@ from .artifact_store import (
     write_baseline,
     write_manifest,
 )
-from .schemas import HarnessRun, ModelAttempt, NO_SIDE_EFFECTS, RunStatus, utc_now
+from .schemas import HarnessRun, ModelAttempt, RunStatus, unverified_attestations, utc_now
 
 PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -89,7 +89,7 @@ def create_harness_run(
             "baseline_commit": resolved_sha,
             "run_dir": str(run_dir(root, rid)),
             "manifest": run.to_dict(),
-            **NO_SIDE_EFFECTS,
+            **unverified_attestations(),
         }
 
     with run_lock(root, rid):
@@ -109,7 +109,7 @@ def create_harness_run(
                 "run_id": rid,
                 "baseline_commit": resolved_sha,
                 "run_dir": str(run_dir(root, rid)),
-                **NO_SIDE_EFFECTS,
+                **unverified_attestations(),
             }
 
         written_manifest = write_manifest(run, root)
@@ -124,7 +124,7 @@ def create_harness_run(
         "run_dir": str(run_dir(root, rid)),
         "manifest_path": str(written_manifest),
         "baseline_path": str(baseline_path),
-        **NO_SIDE_EFFECTS,
+        **unverified_attestations(),
     }
 
 
@@ -167,7 +167,7 @@ def register_model_attempt(
                     "run_id": run_id,
                     "attempt_id": aid,
                     "attempt_path": str(path),
-                    **NO_SIDE_EFFECTS,
+                    **unverified_attestations(),
                 }
             raise RunManagerError(f"attempt_already_exists: {aid}")
 
@@ -187,7 +187,7 @@ def register_model_attempt(
         "run_id": run_id,
         "attempt_id": aid,
         "attempt_path": str(written),
-        **NO_SIDE_EFFECTS,
+        **unverified_attestations(),
     }
 
 
@@ -209,7 +209,7 @@ def get_harness_status(
             "result_count": len(results),
             "latest_comparison": comparison.to_dict() if comparison else None,
             "blockers": _collect_blockers(root, run_id),
-            **NO_SIDE_EFFECTS,
+            **unverified_attestations(),
         }
 
     runs: list[dict[str, Any]] = []
@@ -226,7 +226,7 @@ def get_harness_status(
                 "blockers": _collect_blockers(root, rid),
             }
         )
-    return {"ok": True, "runs": runs, **NO_SIDE_EFFECTS}
+    return {"ok": True, "runs": runs, **unverified_attestations()}
 
 
 def update_run_status(

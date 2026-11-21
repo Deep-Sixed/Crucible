@@ -18,9 +18,10 @@ from .artifact_store import (
 )
 from .schemas import (
     HarnessCloseout,
-    NO_SIDE_EFFECTS,
     OperatorDecision,
     RunStatus,
+    aggregate_attestations,
+    attestation_block,
     utc_now,
 )
 
@@ -91,6 +92,7 @@ def record_harness_closeout(
         artifacts=artifacts,
         validation=validation,
         operator_decision=decision.value,
+        attestations=aggregate_attestations([result.attestations for result in results]),
     )
 
     if dry_run:
@@ -99,8 +101,7 @@ def record_harness_closeout(
             "dry_run": True,
             "run_id": run_id,
             "closeout": closeout.to_dict(),
-            "external_write_performed": False,
-            **NO_SIDE_EFFECTS,
+            **attestation_block(closeout.attestations),
         }
 
     with run_lock(root, run_id):
@@ -114,6 +115,5 @@ def record_harness_closeout(
         "run_id": run_id,
         "closeout_path": str(closeout_path),
         "closeout": closeout.to_dict(),
-        "external_write_performed": False,
-        **NO_SIDE_EFFECTS,
+        **attestation_block(closeout.attestations),
     }
