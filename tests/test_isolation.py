@@ -678,6 +678,7 @@ def test_ordinary_output_is_not_redacted() -> None:
 
 def test_persisted_command_summary_is_redacted(repo: Path, runs_root: Path) -> None:
     secret = "gh" + "p_" + "z" * 36
-    _collected, payload = run_attempt(repo, runs_root, ["echo", f"leaked {secret}"])
+    source = "print('leaked', 'gh' + 'p_' + 'z' * 36)"
+    _collected, payload = run_attempt(repo, runs_root, python_check(source))
     assert secret not in json.dumps(payload)
     assert "[REDACTED]" in payload["test_results"][0]["summary"]

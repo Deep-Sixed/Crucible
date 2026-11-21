@@ -642,7 +642,7 @@ class SubprocessGitExecutor:
 def _display_path(path: str) -> str:
     """Make any filesystem path safe to store in UTF-8 JSON."""
 
-    return path.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return path.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="backslashreplace")
 
 
 def _ref_tips(state: dict[str, str]) -> set[str]:
